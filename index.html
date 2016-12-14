@@ -1,0 +1,513 @@
+<html>
+<head>
+<script src="js/vendor/jquery-3.1.1.js" charset="UTF-8"></script>
+<script src="js/vendor/gl-matrix.js" charset="UTF-8"></script>
+<script src="js/vendor/blockly_compressed.js" charset="UTF-8"></script>
+<script src="js/vendor/blocks_compressed.js" charset="UTF-8"></script>
+<script src="js/vendor/blockly_en.js" charset="UTF-8"></script>
+<script src="js/vendor/blockly_javascript_compressed.js" charset="UTF-8"></script>
+<script src="js/renderer.js" charset="UTF-8"></script>
+<script src="js/blocks.js" charset="UTF-8"></script>
+<script src="js/blocks_style.js" charset="UTF-8"></script>
+<script src="js/gcode.js" charset="UTF-8"></script>
+<script src="js/position.js" charset="UTF-8"></script>
+<style>
+html, body {  
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+}
+</style>
+
+<script id="platform_shader_vertex" type="x-shader/x-vertex">
+    attribute vec3 vertex_position;
+
+    uniform mat4 model_matrix;
+    uniform mat4 projection_matrix;
+    
+    varying vec2 v_pos;
+
+    void main(void)
+    {
+        gl_Position = projection_matrix * model_matrix * vec4(vertex_position, 1.0);
+        v_pos = vertex_position.xy;
+    }
+</script>
+
+<script id="platform_shader_fragment" type="x-shader/x-fragment">
+    precision mediump float;
+    
+    varying vec2 v_pos;
+
+    void main(void)
+    {
+        if (mod(floor(v_pos.x / 10.0) - floor(v_pos.y / 10.0), 2.0) < 1.0)
+            gl_FragColor = vec4(0.6, 0.6, 1.0, 1.0);
+        else
+            gl_FragColor = vec4(0.4, 0.4, 0.8, 1.0);
+    }
+</script>
+
+<script id="lines_shader_vertex" type="x-shader/x-vertex">
+    attribute vec3 vertex_position;
+
+    uniform mat4 model_matrix;
+    uniform mat4 projection_matrix;
+    
+    void main(void)
+    {
+        gl_Position = projection_matrix * model_matrix * vec4(vertex_position, 1.0);
+    }
+</script>
+
+<script id="lines_shader_fragment" type="x-shader/x-fragment">
+    precision mediump float;
+
+    void main(void)
+    {
+        gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+    }
+</script>
+
+<script id="extrusion_lines_shader_vertex" type="x-shader/x-vertex">
+    attribute vec3 vertex_position;
+    attribute float side;
+
+    uniform mat4 model_matrix;
+    uniform mat4 projection_matrix;
+
+    varying float v_side;
+    
+    void main(void)
+    {
+        gl_Position = projection_matrix * model_matrix * vec4(vertex_position, 1.0);
+        v_side = side;
+    }
+</script>
+
+<script id="extrusion_lines_shader_fragment" type="x-shader/x-fragment">
+    precision mediump float;
+
+    varying float v_side;
+    
+    void main(void)
+    {
+        float f = 1.0 - (abs(v_side - 0.5) * 1.0);
+        gl_FragColor = vec4(f, f, f * 0.5, 1.0);
+    }
+</script>
+
+<script>
+var gl;
+var platform_shader;
+var lines_shader;
+var extrusion_lines_shader;
+
+var model_matrix = mat4.create();
+var projection_matrix = mat4.create();
+
+var platform;
+var lines;
+var extrusion_lines;
+
+var workspace;
+
+$().ready(function()
+{
+    var canvas = document.getElementById("render_canvas")
+    gl = canvas.getContext("experimental-webgl");
+    gl.viewport_width = canvas.width;
+    gl.viewport_height = canvas.height;
+
+    $(canvas).mousemove(function(event)
+    {
+        if (event.buttons & 2)
+        {
+            view_yaw += event.offsetX - canvas.prev_mouse_x;
+            view_pitch += event.offsetY - canvas.prev_mouse_y;
+            if (view_pitch < 10) view_pitch = 10;
+            if (view_pitch > 80) view_pitch = 80;
+            draw();
+        }
+        canvas.prev_mouse_x = event.offsetX;
+        canvas.prev_mouse_y = event.offsetY;
+    });
+    $(canvas).bind('wheel', function(event)
+    {
+        view_distance *= 1.0 + (event.originalEvent.deltaY / 1000.0);
+        draw();
+    });
+    $(canvas).contextmenu(function() {
+        return false;
+    });
+
+    platform_shader = new Shader($("#platform_shader_vertex").text(), $("#platform_shader_fragment").text())
+    lines_shader = new Shader($("#lines_shader_vertex").text(), $("#lines_shader_fragment").text())
+    extrusion_lines_shader = new Shader($("#extrusion_lines_shader_vertex").text(), $("#extrusion_lines_shader_fragment").text())
+    
+    platform = new VertexBuffer([
+         100.0,  100.0,  0.0,
+         100.0, -100.0,  0.0,
+        -100.0,  100.0,  0.0,
+
+         100.0, -100.0,  0.0,
+        -100.0,  100.0,  0.0,
+        -100.0, -100.0,  0.0,
+    ]);
+    lines = new VertexBuffer([]);
+    extrusion_lines = new VertexBuffer([]);
+    
+    draw()
+    
+    workspace = Blockly.inject('blockly_div', {
+        toolbox: document.getElementById("toolbox"),
+        trashcan: true,
+        scrollbars: true,
+    });
+    //Blockly.Xml.domToWorkspace(Blockly.Xml.textToDom('<xml><block type="gcode_start" deletable="false"></block></xml>'), workspace);
+    var xml = '<xml xmlns="http://www.w3.org/1999/xhtml"><block type="gcode_start" id=".AWOS|~^yZW(N_iJR4Z{" deletable="false" x="29" y="23"><field name="FLAVOR">UMO</field><next><block type="controls_repeat_ext" id="g7kf$Z[CiIVH(1EX`+v4"><value name="TIMES"><shadow type="math_number" id="HG|/z[`S(gmN6AKo/1{5"><field name="NUM">10</field></shadow></value><statement name="DO"><block type="gcode_move" id="|wk+n-F:A.bG;*8A61|:"><value name="POSITION"><shadow type="gcode_position_xy" id="v2?t+dV8^{jlBcw%bppo"><field name="X">0</field><field name="Y">0</field></shadow><block type="gcode_position_z" id="b,O5sYVqZEM}~GJx/$%T"><field name="Z">5</field></block></value><next><block type="gcode_move" id="2)^#8uKC-uH_XP{h7OT{"><value name="POSITION"><shadow type="gcode_position_xy" id="`a0t|!lvh*`=G_lm*P97"><field name="X">5</field><field name="Y">0</field></shadow></value><next><block type="gcode_move" id="c*(N`;7ncUfMZW#M#E=8"><value name="POSITION"><shadow type="gcode_position_xy" id="d*qNzCnV?orRY!`P^hS^"><field name="X">0</field><field name="Y">5</field></shadow></value></block></next></block></next></block></statement></block></next></block></xml>';
+    if (localStorage.getItem("GCodeXmlGen.code"))
+    {
+        xml = localStorage.getItem("GCodeXmlGen.code");
+    }
+    Blockly.Xml.domToWorkspace(Blockly.Xml.textToDom(xml), workspace);
+    workspace.addChangeListener(Blockly.Events.disableOrphans);
+    workspace.addChangeListener(function(event)
+    {
+        window.loop_trap = 10000;
+        Blockly.JavaScript.INFINITE_LOOP_TRAP = 'if(--window.loop_trap == 0) throw "Infinite loop.";\n';
+    
+        Blockly.JavaScript.addReservedWords('code');
+        var xml = Blockly.Xml.domToText(Blockly.Xml.workspaceToDom(workspace));
+        localStorage.setItem("GCodeXmlGen.code", xml);
+        var code = Blockly.JavaScript.workspaceToCode(workspace);
+        console.debug(code);
+        try
+        {
+            eval(code);
+            console.debug(gcode.getOutput().join('\n'));
+
+            var download_link = document.getElementById("gcode_download_link");
+            download_link.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(gcode.getOutput().join('\n')));
+            download_link.setAttribute('download', 'generated.gcode');
+
+            lines.update(gcode.lines);
+            extrusion_lines.update(gcode.extrusion_lines, 4);
+            draw();
+        }
+        catch (e)
+        {
+            console.error(e);
+        }
+    });
+    
+    $(window).resize(resize);
+    resize();
+});
+
+(function() {
+    var origonal_function = Blockly.Generator.prototype.blockToCode;
+    Blockly.Generator.prototype.blockToCode = function(block)
+    {
+        if (!block)
+            return '';
+        if (block.getRootBlock().type != "gcode_start" && !block.getRootBlock().type.startsWith("procedures_def"))
+            return '';
+        return origonal_function.call(this, block);
+    }
+})();
+
+function resize()
+{
+    var canvas = document.getElementById("render_canvas")
+    var container = $("#render_canvas_container");
+    canvas.height = container.height();
+    canvas.width = container.width();
+    $(canvas).css("left", container.offset().left);
+    $(canvas).css("top", container.offset().top);
+
+    gl.viewport_width = canvas.width;
+    gl.viewport_height = canvas.height;
+
+    draw();
+
+    container = $("#blockly_div_container");
+    var blockly_div = $("#blockly_div");
+    blockly_div.width(container.width());
+    blockly_div.height(container.height());
+    blockly_div.css("left", container.offset().left);
+    blockly_div.css("top", container.offset().top);
+    
+    Blockly.svgResize(workspace);
+}
+
+var view_distance = 200.0;
+var view_yaw = 60;
+var view_pitch = 30;
+
+function draw()
+{
+    gl.viewport(0, 0, gl.viewport_width, gl.viewport_height);
+    gl.clearColor(0.8, 0.8, 0.8, 1.0);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    
+    var tmp = mat4.create()
+    
+    mat4.perspective(projection_matrix, 60 / 180.0 * Math.PI, gl.viewport_width / gl.viewport_height, 0.1, view_distance * 10.0);
+    
+    mat4.fromTranslation(model_matrix, [0.0, 0.0, -view_distance]);
+    
+    mat4.fromXRotation(tmp, -Math.PI / 2.0)
+    mat4.multiply(model_matrix, model_matrix, tmp);
+
+    mat4.fromXRotation(tmp, view_pitch / 180.0 * Math.PI)
+    mat4.multiply(model_matrix, model_matrix, tmp);
+
+    mat4.fromZRotation(tmp, view_yaw / 180.0 * Math.PI)
+    mat4.multiply(model_matrix, model_matrix, tmp);
+    
+    platform.render(platform_shader, gl.TRIANGLES)
+
+    mat4.fromTranslation(tmp, [-100, -100, 0])
+    mat4.multiply(model_matrix, model_matrix, tmp);
+
+    lines.render(lines_shader, gl.LINES)
+    extrusion_lines.render(extrusion_lines_shader, gl.TRIANGLES)
+}
+</script>
+</head>
+<body>
+<table style="width: 100%; height: 100%">
+<tr style="height: 50px"><td colspan="2"></td></tr><a href="" id="gcode_download_link">Download gcode</a>
+<tr><td id="render_canvas_container" style="width: 30%; padding: 0px; margin: 0px"></td>
+<td id="blockly_div_container" style="padding: 0px; margin: 0px"></td>
+</tr></table>
+
+<canvas style="position: absolute; top: 0px; left: 0px;" id="render_canvas" width="500" height="300"></canvas>
+<div id="blockly_div" style="position: absolute; top: 0px; left: 0px; height: 480px; width: 600px;"></div>
+
+<xml id="toolbox" style="display: none">
+  <category name="Printer" colour="#845d49">
+      <block type="gcode_move">
+        <value name="POSITION">
+          <shadow type="gcode_position_xy">
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_extrude_move">
+        <value name="POSITION">
+          <shadow type="gcode_position_xy">
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_hotend_temperature">
+        <value name="TEMPERATURE">
+          <shadow type="math_number">
+            <field name="NUM">200</field>
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_wait">
+        <value name="TIME">
+          <shadow type="math_number">
+            <field name="NUM">1</field>
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_fan">
+        <value name="SPEED">
+          <shadow type="math_number">
+            <field name="NUM">100</field>
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_extrusion_setup">
+        <value name="WIDTH">
+          <shadow type="math_number">
+            <field name="NUM">0.4</field>
+          </shadow>
+        </value>
+        <value name="HEIGHT">
+          <shadow type="math_number">
+            <field name="NUM">0.1</field>
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_speed_setup">
+        <value name="TRAVEL">
+          <shadow type="math_number">
+            <field name="NUM">150</field>
+          </shadow>
+        </value>
+        <value name="EXTRUDE">
+          <shadow type="math_number">
+            <field name="NUM">50</field>
+          </shadow>
+        </value>
+      </block>
+      <block type="gcode_comment"></block>
+      <block type="gcode_position_xy"></block>
+      <block type="gcode_position_z"></block>
+      <block type="gcode_position_angle"></block>
+      <block type="gcode_position_speed"></block>
+      <block type="gcode_position_absolute"></block>
+  </category>
+
+  <category name="Logic" colour="#5C81A6">
+    <block type="controls_if"></block>
+    <block type="logic_compare">
+      <field name="OP">EQ</field>
+    </block>
+    <block type="logic_operation">
+      <field name="OP">AND</field>
+    </block>
+    <block type="logic_negate"></block>
+    <block type="logic_boolean">
+      <field name="BOOL">TRUE</field>
+    </block>
+    <block type="logic_null"></block>
+    <block type="logic_ternary"></block>
+  </category>
+  <category name="Loops" colour="#5CA65C">
+    <block type="controls_repeat_ext">
+      <value name="TIMES">
+        <shadow type="math_number">
+          <field name="NUM">10</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="controls_whileUntil">
+      <field name="MODE">WHILE</field>
+    </block>
+    <block type="controls_for">
+      <field name="VAR">i</field>
+      <value name="FROM">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+      <value name="TO">
+        <shadow type="math_number">
+          <field name="NUM">10</field>
+        </shadow>
+      </value>
+      <value name="BY">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="controls_forEach">
+      <field name="VAR">j</field>
+    </block>
+    <block type="controls_flow_statements">
+      <field name="FLOW">BREAK</field>
+    </block>
+  </category>
+  <category name="Math" colour="#5C68A6">
+    <block type="math_round">
+      <field name="OP">ROUND</field>
+      <value name="NUM">
+        <shadow type="math_number">
+          <field name="NUM">3.1</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_number">
+      <field name="NUM">0</field>
+    </block>
+    <block type="math_single">
+      <field name="OP">ROOT</field>
+      <value name="NUM">
+        <shadow type="math_number">
+          <field name="NUM">9</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_trig">
+      <field name="OP">SIN</field>
+      <value name="NUM">
+        <shadow type="math_number">
+          <field name="NUM">45</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_constant">
+      <field name="CONSTANT">PI</field>
+    </block>
+    <block type="math_number_property">
+      <mutation divisor_input="false"></mutation>
+      <field name="PROPERTY">EVEN</field>
+      <value name="NUMBER_TO_CHECK">
+        <shadow type="math_number">
+          <field name="NUM">0</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_arithmetic">
+      <field name="OP">ADD</field>
+      <value name="A">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+      <value name="B">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_on_list">
+      <mutation op="SUM"></mutation>
+      <field name="OP">SUM</field>
+    </block>
+    <block type="math_modulo">
+      <value name="DIVIDEND">
+        <shadow type="math_number">
+          <field name="NUM">64</field>
+        </shadow>
+      </value>
+      <value name="DIVISOR">
+        <shadow type="math_number">
+          <field name="NUM">10</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_constrain">
+      <value name="VALUE">
+        <shadow type="math_number">
+          <field name="NUM">50</field>
+        </shadow>
+      </value>
+      <value name="LOW">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+      <value name="HIGH">
+        <shadow type="math_number">
+          <field name="NUM">100</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_random_int">
+      <value name="FROM">
+        <shadow type="math_number">
+          <field name="NUM">1</field>
+        </shadow>
+      </value>
+      <value name="TO">
+        <shadow type="math_number">
+          <field name="NUM">100</field>
+        </shadow>
+      </value>
+    </block>
+    <block type="math_random_float"></block>
+  </category>
+  <category name="Variables" colour="#A65C81" custom="VARIABLE"></category>
+  <category name="Functions" colour="#9A5CA6" custom="PROCEDURE"></category>
+</xml>
+</body>
+</html>
